@@ -1,0 +1,172 @@
+#!/bin/bash
+#
+# Auteur : Denny Huang <denny0223@gmail.com>
+# Date : Mercredi 17 septembre 2014
+# Licence MIT
+
+# Fonction pour afficher l'aide
+function show_help {
+    echo -e "Usage: scrabble <url> [-v] [-h] [-s] [-e <extensions>]\n"
+    echo -e "Options :"
+    echo -e "\t-v\tActiver la sortie verbeuse"
+    echo -e "\t-h\tAfficher cette aide"
+    echo -e "\t-s\tSauvegarder et compresser le dépôt téléchargé"
+    echo -e "\t-e\tExclure les fichiers avec les extensions spécifiées (séparées par des virgules)"
+    echo -e "\nExemple: scrabble http://example.com/ -v -s -e jpg,png\n"
+    echo -e "Assurez-vous que l'URL cible possède un dossier .git accessible"
+}
+
+# Fonction de téléchargement avec gestion des erreurs
+function downloadBlob {
+    [ "$verbose" = true ] && echo "Téléchargement du blob $1"
+
+    mkdir -p ${1:0:2}
+    cd ${1:0:2}
+
+    local url="$domain/.git/objects/${1:0:2}/${1:2}"
+    local retries=3
+    local success=false
+
+    for ((i=0; i<$retries; i++)); do
+        if curl -s --retry 3 --retry-delay 5 --retry-max-time 30 -O $url; then
+            success=true
+            break
+        else
+            [ "$verbose" = true ] && echo "Réessai de téléchargement du blob $1 ($((i+1))/$retries)"
+            sleep 1
+        fi
+    done
+
+    if ! $success; then
+        echo "Erreur de téléchargement du blob $1"
+        cd ..
+        exit 1
+    fi
+
+    cd ..
+}
+
+# Fonction d'analyse d'un arbre
+function parseTree {
+    [ "$verbose" = true ] && echo "Analyse de l'arbre $1"
+
+    downloadBlob $1
+
+    while read line; do
+        type=$(echo $line | awk '{print $2}')
+        hash=$(echo $line | awk '{print $3}')
+        path=$(echo $line | awk '{print $4}')
+
+        if [[ -n $exclude_ext ]]; then
+            ext="${path##*.}"
+            if [[ $exclude_ext =~ $ext ]]; then
+                [ "$verbose" = true ] && echo "Exclusion du fichier $path"
+                continue
+            fi
+        fi
+
+        [ "$type" = "tree" ] && parseTree $hash || downloadBlob $hash
+    done < <(git cat-file -p $1)
+}
+
+# Fonction d'analyse d'un commit
+function parseCommit {
+    [ "$verbose" = true ] && echo "Analyse du commit $1"
+
+    downloadBlob $1
+
+    tree=$(git cat-file -p $1 | sed -n '1p' | awk '{print $2}')
+    parseTree $tree
+
+    parent=$(git cat-file -p $1 | sed -n '2p' | awk '{print $2}')
+
+    [ ${#parent} -eq 40 ] && parseCommit $parent
+}
+
+# Fonction de validation de l'URL
+function validateURL {
+    if [[ ! $1 =~ ^https?:// ]]; then
+        echo "URL invalide : $1"
+        exit 1
+    fi
+}
+
+# Fonction de sauvegarde et compression
+function save_and_compress {
+    tar -czf git_repo.tar.gz .git
+    echo "Dépôt sauvegardé et compressé dans git_repo.tar.gz"
+}
+
+# Traitement des options de ligne de commande
+verbose=false
+save=false
+exclude_ext=""
+
+while getopts ":vhs:e:" opt; do
+    case $opt in
+        v)
+            verbose=true
+            ;;
+        h)
+            show_help
+            exit 0
+            ;;
+        s)
+            save=true
+            ;;
+        e)
+            exclude_ext=$(echo $OPTARG | tr ',' '|')
+            ;;
+        \?)
+            echo "Option invalide: -$OPTARG" >&2
+            show_help
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND -1))
+
+# Vérification des arguments
+if [ -z $1 ]; then
+    echo -e "URL cible manquante\n"
+    show_help
+    exit 1
+fi
+
+domain=$1
+
+# Validation de l'URL
+validateURL $domain
+
+ref=$(curl -s --retry 3 --retry-delay 5 --retry-max-time 30 $domain/.git/HEAD | awk '{print $2}')
+
+if [ -z "$ref" ]; then
+    echo "Impossible de récupérer la référence HEAD"
+    exit 1
+fi
+
+lastHash=$(curl -s --retry 3 --retry-delay 5 --retry-max-time 30 $domain/.git/$ref)
+
+if [ -z "$lastHash" ]; then
+    echo "Impossible de récupérer le dernier hash du commit"
+    exit 1
+fi
+
+# Initialisation du dépôt Git
+git init
+
+cd .git/objects/
+
+parseCommit $lastHash
+
+cd ../../
+
+echo $lastHash > .git/refs/heads/master
+
+git reset --hard
+
+if [ "$save" = true ]; then
+    save_and_compress
+fi
+
+echo "Téléchargement et configuration terminés avec succès."
